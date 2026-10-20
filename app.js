@@ -5,68 +5,70 @@ let apps = [];     // edu_apps
 let courses = [];  // edu_courses
 
 // ===== 저장 위치 =====
-// 데이터를 읽고 쓰는 곳은 이 네 함수뿐이다.
-// 저장 위치를 바꿀 때는 이 부분만 고치면 된다.
-const KEY_APPS = 'edu_apps';
-const KEY_COURSES = 'edu_courses';
+// 데이터를 읽고 쓰는 곳은 이 네 함수뿐이다. (Supabase DB : edu_courses, edu_apps)
+// 오류가 오면 throw하고, 화면 함수가 메시지로 보여 준다. (F-11)
+const db = (typeof supabase !== 'undefined' && typeof SUPABASE_URL !== 'undefined')
+  ? supabase.createClient(SUPABASE_URL, SUPABASE_KEY)
+  : null;
 
-function seedData() {
-  const now = Date.now();
-  const at = i => now - (10 - i) * 60000; // 신청 순서 기록용 (표시에는 안 씀)
-  courses = [
-    { course: '정보보안 기본', capacity: 5 },
-    { course: '생성형 AI 실무', capacity: 5 },
-    { course: '보고서 작성 기초', capacity: 5 },
-  ];
-  apps = [
-    { id: 1, course: '정보보안 기본', date: '2026-09-24', hours: 3, name: '김가상', team: '기획팀', status: '이수', createdAt: at(1) },
-    { id: 2, course: '정보보안 기본', date: '2026-09-24', hours: 3, name: '이가상', team: '안전팀', status: '이수', createdAt: at(2) },
-    { id: 3, course: '정보보안 기본', date: '2026-09-24', hours: 3, name: '박가상', team: '운영팀', status: '취소', createdAt: at(3) },
-    { id: 4, course: '생성형 AI 실무', date: '2026-10-16', hours: 7, name: '김가상', team: '기획팀', status: '신청', createdAt: at(4) },
-    { id: 5, course: '생성형 AI 실무', date: '2026-10-16', hours: 7, name: '최가상', team: '안전팀', status: '신청', createdAt: at(5) },
-    { id: 6, course: '생성형 AI 실무', date: '2026-10-16', hours: 7, name: '정가상', team: '운영팀', status: '신청', createdAt: at(6) },
-    { id: 7, course: '생성형 AI 실무', date: '2026-10-16', hours: 7, name: '한가상', team: '기획팀', status: '신청', createdAt: at(7) },
-    { id: 8, course: '보고서 작성 기초', date: '2026-11-05', hours: 4, name: '오가상', team: '운영팀', status: '신청', createdAt: at(8) },
-  ];
-  saveAll();
+// DB 오류를 화면 문구로 바꾼다 (트리거가 보낸 한국어 메시지는 그대로 쓴다)
+function dbError(error) {
+  if (error.code === '23505') return new Error('중복 신청 : 같은 과정에 이미 신청한 이름입니다.');
+  if (error.code === '23514') return new Error('DB 규칙에 맞지 않는 값입니다.');
+  if (error.code === '42501') return new Error('권한이 없습니다.');
+  return new Error(error.message);
 }
 
-function saveAll() {
-  localStorage.setItem(KEY_APPS, JSON.stringify(apps));
-  localStorage.setItem(KEY_COURSES, JSON.stringify(courses));
+// 쓰기에 실패해도 화면은 DB 기준으로 다시 그리도록 읽어 둔다
+async function reloadQuietly() {
+  try { await loadData(); } catch (e) { /* 원래 오류를 알리는 게 먼저다 */ }
 }
 
-// 전체 불러오기
+// 전체 불러오기 (F-09)
 async function loadData() {
-  try {
-    apps = JSON.parse(localStorage.getItem(KEY_APPS)) || [];
-    courses = JSON.parse(localStorage.getItem(KEY_COURSES)) || [];
-  } catch (e) {
-    apps = []; courses = [];
-  }
-  if (apps.length === 0) seedData();
+  if (!db) throw new Error('Supabase 연결 준비가 안 됐습니다. (supabase-js, config.js 확인)');
+  const [c, a] = await Promise.all([
+    db.from('edu_courses').select('course, capacity').order('course'),
+    db.from('edu_apps').select('id, course, date, hours, name, team, status, created_at').order('id'),
+  ]);
+  if (c.error) throw dbError(c.error);
+  if (a.error) throw dbError(a.error);
+  courses = c.data;
+  apps = a.data.map(({ created_at, ...rest }) => ({ ...rest, createdAt: created_at })); // created_at → createdAt
 }
 
-// 신청 1건 저장 (과정이 처음이면 정원 5명으로 함께 등록)
+// 신청 1건 저장 (상태 '신청'·과정 자동 등록·R-01·R-02는 DB 트리거가 처리)
 async function insertApp(app) {
-  const nextId = apps.reduce((m, a) => Math.max(m, a.id), 0) + 1;
-  apps.push({ ...app, id: nextId, createdAt: Date.now() });
-  if (!courses.some(c => c.course === app.course)) courses.push({ course: app.course, capacity: DEFAULT_CAPACITY });
-  saveAll();
+  if (!db) throw new Error('Supabase 연결 준비가 안 됐습니다.');
+  const { course, date, hours, name, team } = app; // 이 5칸만 쓸 권한이 있다 (R-06)
+  const { error } = await db.from('edu_apps').insert({ course, date, hours, name, team });
+  if (error) {
+    await reloadQuietly();
+    throw dbError(error);
+  }
+  await loadData(); // 다른 사람이 넣은 신청까지 DB 기준으로 다시 읽는다
 }
 
-// 상태 변경 저장
+// 상태 변경 저장 (R-04는 DB 트리거가 한 번 더 검사)
 async function updateStatus(id, newStatus) {
-  const app = apps.find(a => a.id === id);
-  if (app) app.status = newStatus;
-  saveAll();
+  if (!db) throw new Error('Supabase 연결 준비가 안 됐습니다.');
+  const { data, error } = await db.from('edu_apps').update({ status: newStatus }).eq('id', id).select('id');
+  if (error || data.length === 0) {
+    await reloadQuietly();
+    throw error ? dbError(error) : new Error('해당 신청을 찾지 못했습니다.');
+  }
+  await loadData();
 }
 
 // 정원 변경 저장
 async function updateCapacity(course, capacity) {
-  const c = courses.find(x => x.course === course);
-  if (c) c.capacity = capacity; else courses.push({ course, capacity });
-  saveAll();
+  if (!db) throw new Error('Supabase 연결 준비가 안 됐습니다.');
+  const { data, error } = await db.from('edu_courses').update({ capacity }).eq('course', course).select('course');
+  if (error || data.length === 0) {
+    await reloadQuietly();
+    throw error ? dbError(error) : new Error('해당 과정을 찾지 못했습니다.');
+  }
+  await loadData();
 }
 // ===== 저장 위치 끝 =====
 
@@ -164,6 +166,18 @@ async function setCapacity(course, value) {
     return;
   }
   showMessage(`「${course}」 정원을 ${cap}명으로 바꿨습니다.`, 'ok');
+  renderAll();
+}
+
+// ---- F-10 새로 불러오기 ----
+async function reloadData() {
+  try {
+    await loadData();
+  } catch (e) {
+    showMessage('데이터를 불러오지 못했습니다 : ' + e.message, 'error');
+    return;
+  }
+  showMessage('DB에서 새로 불러왔습니다.', 'ok');
   renderAll();
 }
 
@@ -280,6 +294,7 @@ function fillCourseInfo() {
 document.addEventListener('DOMContentLoaded', async () => {
   $('applyForm').addEventListener('submit', e => { e.preventDefault(); addApplication(); });
   $('courseInput').addEventListener('change', fillCourseInfo);
+  $('reloadBtn').addEventListener('click', reloadData);
   try {
     await loadData();
   } catch (e) {
